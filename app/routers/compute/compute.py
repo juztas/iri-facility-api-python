@@ -15,6 +15,10 @@ router = iri_router.IriRouter(
     tags=["compute"],
 )
 
+# Define openapi extra's. See doe-iri docs for details on what these mean. We can adjust as needed when we finalize the API design.
+API_MATURITY = "incubator"
+API_LEVEL = "required"
+
 
 @router.post(
     "/job/{resource_id:str}",
@@ -23,6 +27,7 @@ router = iri_router.IriRouter(
     response_model_exclude_unset=True,
     responses=DEFAULT_RESPONSES,
     operation_id="launchJob",
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def submit_job(
     resource_id: str,
@@ -94,6 +99,7 @@ async def submit_job(
     response_model_exclude_unset=True,
     responses=DEFAULT_RESPONSES,
     operation_id="updateJob",
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def update_job(
     resource_id: str,
@@ -129,6 +135,7 @@ async def update_job(
     response_model_exclude_unset=True,
     responses=DEFAULT_RESPONSES,
     operation_id="getJob",
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def get_job_status(
     resource_id: str,
@@ -159,6 +166,7 @@ async def get_job_status(
     response_model_exclude_unset=True,
     responses=DEFAULT_RESPONSES,
     operation_id="getJobs",
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def get_job_statuses(
     resource_id: str,
@@ -192,6 +200,7 @@ async def get_job_statuses(
     response_model_exclude_unset=True,
     responses=DEFAULT_RESPONSES,
     operation_id="cancelJob",
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def cancel_job(
     resource_id: str,

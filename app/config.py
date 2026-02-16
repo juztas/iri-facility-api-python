@@ -9,7 +9,7 @@ API_VERSION = "1.0.0"
 
 # lines in the description can't have indentation (markup format)
 description = """
-A simple implementation of the IRI facility API using python and the fastApi library.
+A simple implementation of the IRI facility API using Python and the FastAPI library.
 
 For more information, see: [https://iri.science/](https://iri.science/)
 
@@ -23,8 +23,11 @@ API_CONFIG = {
     "description": description,
     "version": API_VERSION,
     "docs_url": "/",
-    "contact": {"name": "Facility API contact", "url": "https://www.somefacility.gov/about/contact-us/"},
-    "terms_of_service": "https://www.somefacility.gov/terms-of-service",
+    "contact": {"name": "The IRI Interfaces Subcommittee", "url": "https://iri.science/ts/interfaces/"},
+    "terms_of_service": """IRI Facility API Copyright (c) 2025. The Regents of the University
+    of California, through Lawrence Berkeley National Laboratory (subject to receipt
+    of any required approvals from the U.S. Dept. of Energy).  All rights reserved.""",
+    "license": {"name": "BSD-3-Clause", "url": "https://opensource.org/license/bsd-3-clause/"}
 }
 try:
     # optionally overload the init params

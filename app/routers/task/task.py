@@ -8,6 +8,9 @@ router = iri_router.IriRouter(
     prefix="/task",
     tags=["task"],
 )
+# Define openapi extra's. See doe-iri docs for details on what these mean. We can adjust as needed when we finalize the API design.
+API_MATURITY = "incubator"
+API_LEVEL = "required"
 
 
 @router.get(
@@ -16,14 +19,7 @@ router = iri_router.IriRouter(
     response_model_exclude_unset=True,
     responses=DEFAULT_RESPONSES,
     operation_id="getTask",
-    openapi_extra={
-        "x-iri": {
-            "maturity": "candidate",
-            "implementation": {
-                "level": "optional"
-            }
-        }
-    },
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def get_task(
     request: Request,
@@ -39,7 +35,7 @@ async def get_task(
     return task
 
 
-@router.get("", dependencies=[Depends(router.current_user)], response_model_exclude_unset=True, responses=DEFAULT_RESPONSES, operation_id="getTasks")
+@router.get("", dependencies=[Depends(router.current_user)], response_model_exclude_unset=True, responses=DEFAULT_RESPONSES, operation_id="getTasks", openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL))
 @router.get("/", responses=DEFAULT_RESPONSES, operation_id="getTasksWithSlash", include_in_schema=False)
 
 async def get_tasks(
@@ -56,6 +52,7 @@ async def get_tasks(
     dependencies=[Depends(router.current_user)],
     responses=DEFAULT_RESPONSES,
     operation_id="deleteTask",
+    openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
 )
 async def delete_task(
     request: Request,

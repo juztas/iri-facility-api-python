@@ -8,8 +8,16 @@ from . import facility_adapter, models
 
 router = iri_router.IriRouter(facility_adapter.FacilityAdapter, prefix="/facility", tags=["facility"])
 
+# Define openapi extra's. See doe-iri docs for details on what these mean. We can adjust as needed when we finalize the API design.
+API_MATURITY = "graduated"
+API_LEVEL = "required"
 
-@router.get("", responses=DEFAULT_RESPONSES, operation_id="getFacility", response_model_exclude_none=True,)
+@router.get("",
+            responses=DEFAULT_RESPONSES,
+            operation_id="getFacility",
+            response_model_exclude_none=True,
+            openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
+            )
 @router.get("/", responses=DEFAULT_RESPONSES, operation_id="getFacilityWithSlash", response_model_exclude_none=True, include_in_schema=False,)
 async def get_facility(
     request: Request,
@@ -23,7 +31,12 @@ async def get_facility(
     return facility
 
 
-@router.get("/sites", responses=DEFAULT_RESPONSES, operation_id="getSites", response_model_exclude_none=True,)
+@router.get("/sites",
+            responses=DEFAULT_RESPONSES,
+            operation_id="getSites",
+            response_model_exclude_none=True,
+            openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL)
+            )
 async def list_sites(
     request: Request,
     modified_since: StrictDateTime = Query(default=None),
@@ -37,7 +50,11 @@ async def list_sites(
     return await router.adapter.list_sites(modified_since=modified_since, name=name, offset=offset, limit=limit, short_name=short_name)
 
 
-@router.get("/sites/{site_id}", responses=DEFAULT_RESPONSES, operation_id="getSite", response_model_exclude_none=True,)
+@router.get("/sites/{site_id}",
+            responses=DEFAULT_RESPONSES,
+            operation_id="getSite",
+            response_model_exclude_none=True,
+            openapi_extra=iri_router.gen_openapi_extra(maturity=API_MATURITY, level=API_LEVEL))
 async def get_site(
     request: Request,
     site_id: str,

@@ -10,6 +10,20 @@ from .account.models import User
 
 bearer_token = APIKeyHeader(name="Authorization")
 
+def gen_openapi_extra(maturity: str, level: str, required_if: dict = None) -> dict:
+    """Helper function to generate the openapi_extra field for IRI endpoints."""
+    main = {"x-iri": {
+                "maturity": maturity,
+                "implementation": {
+                    "level": level
+                    }
+                }
+            }
+    required_if = required_if or {}
+    for k, v in required_if.items():
+        main["x-iri"]["implementation"][f"required_if_{k}"] = v
+    return main
+
 
 def get_client_ip(request: Request) -> str | None:
     forwarded_for = request.headers.get("X-Forwarded-For")
