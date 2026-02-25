@@ -90,7 +90,6 @@ class GetFileHeadResponse(BaseModel):
     """Represents the response for reading the beginning of a file."""
     output: FileContent|None = Field(default=None, description="File content from the beginning")
 
-
 class GetFileTailResponse(BaseModel):
     """Represents the response for reading the end of a file."""
     output: FileContent|None = Field(default=None, description="File content from the end")
