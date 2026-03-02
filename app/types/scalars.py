@@ -57,11 +57,17 @@ class StrictDateTime:
     @staticmethod
     def validate(value):
         """Validate the input value as a strict ISO8601 datetime."""
+        if value is None:
+            return None
         if isinstance(value, datetime.datetime):
             return StrictDateTime._normalize(value)
         if not isinstance(value, str):
             raise ValueError("Invalid datetime value. Expected ISO8601 datetime string.")
         v = value.strip()
+
+        if v == "" or v.lower() == "null":
+            return None
+
         if v.endswith("Z"):
             v = v[:-1] + "+00:00"
         try:
