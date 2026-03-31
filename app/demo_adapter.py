@@ -30,6 +30,8 @@ from .routers.status import facility_adapter as status_adapter
 from .routers.status import models as status_models
 from .routers.task import facility_adapter as task_adapter
 from .routers.task import models as task_models
+from .routers.storage import facility_adapter as storage_adapter
+from .routers.storage import models as storage_models
 from .types.models import Capability
 from .types.user import User
 from .types.scalars import AllocationUnit
@@ -96,7 +98,7 @@ def utc_timestamp() -> int:
 
 
 class DemoAdapter(
-    status_adapter.FacilityAdapter, account_adapter.FacilityAdapter, compute_adapter.FacilityAdapter, filesystem_adapter.FacilityAdapter, task_adapter.FacilityAdapter, facility_adapter.FacilityAdapter
+    status_adapter.FacilityAdapter, account_adapter.FacilityAdapter, compute_adapter.FacilityAdapter, filesystem_adapter.FacilityAdapter, task_adapter.FacilityAdapter, storage_adapter.FacilityAdapter, facility_adapter.FacilityAdapter
 ):
     """A demo implementation of the FacilityAdapter that returns hardcoded data."""
     def __init__(self):
@@ -1007,6 +1009,143 @@ class DemoAdapter(
                 t.status = task_models.TaskStatus.canceled
                 t.result = None
                 break
+
+    # ------------------------------------------------------------------
+    # Storage adapter — logical file name / directory normalisation
+    # ------------------------------------------------------------------
+
+    # Facility-wide summaries of supported logical storage areas.
+    _STORAGE_SUMMARIES: list[storage_models.StorageLocationSummary] = [
+        storage_models.StorageLocationSummary(
+            logical_name=storage_models.LogicalName.home,
+            description="Permanent NFS home directory. Small quota; not suitable for large-scale I/O.",
+            filesystem="nfs-home",
+            performance_tier=storage_models.PerformanceTier.low,
+        ),
+        storage_models.StorageLocationSummary(
+            logical_name=storage_models.LogicalName.scratch,
+            description="High-performance Lustre scratch filesystem. Files purged after 30 days of inactivity.",
+            filesystem="lustre-scratch",
+            performance_tier=storage_models.PerformanceTier.high,
+        ),
+        storage_models.StorageLocationSummary(
+            logical_name=storage_models.LogicalName.project,
+            description="GPFS project space shared across a project team. No automatic purge.",
+            filesystem="gpfs-project",
+            performance_tier=storage_models.PerformanceTier.medium,
+        ),
+        storage_models.StorageLocationSummary(
+            logical_name=storage_models.LogicalName.archive,
+            description="HPSS tape archive for long-term storage. High latency; not suitable for jobs.",
+            filesystem="hpss",
+            performance_tier=storage_models.PerformanceTier.archive,
+        ),
+    ]
+
+    # Per-resource storage mount definitions.
+    # Keys: resource name (matched by demo resource name substring).
+    # Each value is a list of StorageMount objects.
+    def _build_storage_mounts(self, user_id: str, project: str | None) -> list[storage_models.StorageMount]:
+        """Build demo storage mount list, personalising paths with user_id and project."""
+        uid = user_id or "demo_user"
+        initial = uid[0] if uid else "d"
+        proj = project or "m1234"
+
+        return [
+            storage_models.StorageMount(
+                logical_name=storage_models.LogicalName.home,
+                path=f"/global/homes/{initial}/{uid}",
+                filesystem="nfs-home",
+                performance_tier=storage_models.PerformanceTier.low,
+                quota_bytes=50 * 1024 ** 3,       # 50 GiB
+                available_bytes=38 * 1024 ** 3,
+                purge_policy_days=None,
+                shared=False,
+                access=storage_models.StorageAccess(read=True, write=False, execute=True),
+                access_outside_of_job=storage_models.StorageAccess(read=True, write=True, execute=True),
+            ),
+            storage_models.StorageMount(
+                logical_name=storage_models.LogicalName.scratch,
+                path=f"/pscratch/sd/{initial}/{uid}",
+                filesystem="lustre-scratch",
+                performance_tier=storage_models.PerformanceTier.high,
+                quota_bytes=20 * 1024 ** 4,       # 20 TiB
+                available_bytes=15 * 1024 ** 4,
+                purge_policy_days=30,
+                shared=False,
+                access=storage_models.StorageAccess(read=True, write=True, execute=True),
+                access_outside_of_job=storage_models.StorageAccess(read=True, write=True, execute=True),
+            ),
+            storage_models.StorageMount(
+                logical_name=storage_models.LogicalName.project,
+                path=f"/global/project/projectdirs/{proj}",
+                filesystem="gpfs-project",
+                performance_tier=storage_models.PerformanceTier.medium,
+                quota_bytes=100 * 1024 ** 4,      # 100 TiB
+                available_bytes=82 * 1024 ** 4,
+                purge_policy_days=None,
+                shared=True,
+                access=storage_models.StorageAccess(read=True, write=True, execute=True),
+                access_outside_of_job=storage_models.StorageAccess(read=True, write=True, execute=True),
+            ),
+            storage_models.StorageMount(
+                logical_name=storage_models.LogicalName.archive,
+                path=f"/home/{initial}/{uid}",
+                filesystem="hpss",
+                performance_tier=storage_models.PerformanceTier.archive,
+                quota_bytes=500 * 1024 ** 4,      # 500 TiB
+                available_bytes=480 * 1024 ** 4,
+                purge_policy_days=None,
+                shared=False,
+                # Archive is not directly accessible from inside compute jobs.
+                access=storage_models.StorageAccess(read=False, write=False, execute=False),
+                access_outside_of_job=storage_models.StorageAccess(read=True, write=True, execute=False),
+            ),
+        ]
+
+    async def list_storage_summaries(self) -> list[storage_models.StorageLocationSummary]:
+        return list(self._STORAGE_SUMMARIES)
+
+    async def list_storage_locations(
+        self,
+        resource_id: str,
+        logicalpath: storage_models.LogicalName | None = None,
+        project: str | None = None,
+        intent: storage_models.Intent | None = None,
+        user_id: str | None = None,
+    ) -> list[storage_models.StorageLocation]:
+        mounts = self._build_storage_mounts(user_id, project)
+        # Convert StorageMount → StorageLocation (drop access_outside_of_job)
+        locations: list[storage_models.StorageLocation] = [
+            storage_models.StorageLocation(**m.model_dump(exclude={"access_outside_of_job"}))
+            for m in mounts
+        ]
+        if logicalpath is not None:
+            locations = [loc for loc in locations if loc.logical_name == logicalpath]
+        # Intent hint: for long-term-storage, prefer archive; for write/staging, exclude archive.
+        if intent == storage_models.Intent.long_term_storage:
+            archive = [loc for loc in locations if loc.logical_name == storage_models.LogicalName.archive]
+            if archive:
+                return archive
+        elif intent in (storage_models.Intent.write, storage_models.Intent.staging):
+            locations = [loc for loc in locations if loc.logical_name != storage_models.LogicalName.archive]
+        return locations
+
+    async def list_storage_mounts(
+        self,
+        resource_id: str,
+        project: str | None = None,
+        intent: storage_models.Intent | None = None,
+        user_id: str | None = None,
+    ) -> list[storage_models.StorageMount]:
+        mounts = self._build_storage_mounts(user_id, project)
+        if intent == storage_models.Intent.long_term_storage:
+            archive = [m for m in mounts if m.logical_name == storage_models.LogicalName.archive]
+            if archive:
+                return archive
+        elif intent in (storage_models.Intent.write, storage_models.Intent.staging):
+            mounts = [m for m in mounts if m.logical_name != storage_models.LogicalName.archive]
+        return mounts
 
 
 class DemoTask(BaseModel):
