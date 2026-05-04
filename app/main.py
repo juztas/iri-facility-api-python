@@ -4,12 +4,15 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from opentelemetry import trace
+from opentelemetry import trace, metrics
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, BatchSpanProcessor, SimpleSpanProcessor
 from opentelemetry.sdk.trace.sampling import TraceIdRatioBased, ParentBased
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from . import config
@@ -26,23 +29,29 @@ from app.routers.task import task
 configure_logging(config.LOG_LEVEL)
 
 # ------------------------------------------------------------------
-# OpenTelemetry Tracing Configuration
+# OpenTelemetry Configuration
 # ------------------------------------------------------------------
+meter_provider = None
 if config.OPENTELEMETRY_ENABLED:
     resource = Resource.create({"service.name": "iri-facility-api", "service.version": config.API_VERSION, "service.endpoint": config.API_URL_ROOT})
 
-    samplerate = "1.0" if config.OPENTELEMETRY_DEBUG else config.OTEL_SAMPLE_RATE
-    provider = TracerProvider(resource=resource, sampler=ParentBased(TraceIdRatioBased(samplerate)))
-    trace.set_tracer_provider(provider)
+    if config.OTEL_TRACES_ENABLED:
+        samplerate = "1.0" if config.OPENTELEMETRY_DEBUG else config.OTEL_SAMPLE_RATE
+        tracer_provider = TracerProvider(resource=resource, sampler=ParentBased(TraceIdRatioBased(samplerate)))
+        if config.OTLP_ENDPOINT:
+            span_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=config.OTLP_ENDPOINT, insecure=True))
+        else:
+            span_processor = SimpleSpanProcessor(ConsoleSpanExporter())
+        tracer_provider.add_span_processor(span_processor)
+        trace.set_tracer_provider(tracer_provider)
 
-    if config.OTLP_ENDPOINT:
-        exporter = OTLPSpanExporter(endpoint=config.OTLP_ENDPOINT, insecure=True)
-        span_processor = BatchSpanProcessor(exporter)
-    else:
-        exporter = ConsoleSpanExporter()
-        span_processor = SimpleSpanProcessor(exporter)
-    provider.add_span_processor(span_processor)
-    tracer = trace.get_tracer(__name__)
+    if config.OTEL_METRICS_ENABLED:
+        if config.OTLP_ENDPOINT:
+            metric_reader = PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=config.OTLP_ENDPOINT, insecure=True), export_interval_millis=config.OTEL_METRIC_EXPORT_INTERVAL)
+        else:
+            metric_reader = PeriodicExportingMetricReader(ConsoleMetricExporter(), export_interval_millis=config.OTEL_METRIC_EXPORT_INTERVAL)
+        meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        metrics.set_meter_provider(meter_provider)
 # ------------------------------------------------------------------
 
 @asynccontextmanager
@@ -56,6 +65,8 @@ async def lifespan(app: FastAPI):
             if ctrl and hasattr(ctrl, "close"):
                 logger.info("Calling close for %s.%s", r.prefix, attr)
                 await ctrl.close()
+    if meter_provider:
+        meter_provider.shutdown()
 
 APP = FastAPI(servers=[{"url": config.API_URL_ROOT}], lifespan=lifespan, **config.API_CONFIG)
 
