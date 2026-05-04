@@ -2,6 +2,7 @@
 """Main API application"""
 
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -44,7 +45,19 @@ if config.OPENTELEMETRY_ENABLED:
     tracer = trace.get_tracer(__name__)
 # ------------------------------------------------------------------
 
-APP = FastAPI(servers=[{"url": config.API_URL_ROOT}], **config.API_CONFIG)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    logger = logging.getLogger(__name__)
+    for r in [task.router, filesystem.router]:
+        for attr in ("adapter", "task_adapter"):
+            adapter = getattr(r, attr, None)
+            ctrl = getattr(adapter, "task_controller", None)
+            if ctrl and hasattr(ctrl, "close"):
+                logger.info("Calling close for %s.%s", r.prefix, attr)
+                await ctrl.close()
+
+APP = FastAPI(servers=[{"url": config.API_URL_ROOT}], lifespan=lifespan, **config.API_CONFIG)
 
 if config.OPENTELEMETRY_ENABLED:
     FastAPIInstrumentor.instrument_app(APP)
