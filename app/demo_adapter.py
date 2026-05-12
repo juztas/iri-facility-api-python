@@ -2,6 +2,7 @@
 A demo adapter for the IRI Facility API that returns hardcoded data.
 This is useful for testing and development of the API without needing to connect to real resources
 """
+import asyncio
 import base64
 import datetime
 import glob
@@ -26,6 +27,9 @@ from .routers.facility import facility_adapter
 from .routers.facility import models as facility_models
 from .routers.filesystem import facility_adapter as filesystem_adapter
 from .routers.filesystem import models as filesystem_models
+from .routers.interactive import facility_adapter as interactive_adapter
+from .routers.interactive import models as interactive_models
+from .routers.interactive.store import InMemoryInteractiveStore
 from .routers.status import facility_adapter as status_adapter
 from .routers.status import models as status_models
 from .routers.task import facility_adapter as task_adapter
@@ -96,7 +100,7 @@ def utc_timestamp() -> int:
 
 
 class DemoAdapter(
-    status_adapter.FacilityAdapter, account_adapter.FacilityAdapter, compute_adapter.FacilityAdapter, filesystem_adapter.FacilityAdapter, task_adapter.FacilityAdapter, facility_adapter.FacilityAdapter
+    status_adapter.FacilityAdapter, account_adapter.FacilityAdapter, compute_adapter.FacilityAdapter, filesystem_adapter.FacilityAdapter, task_adapter.FacilityAdapter, interactive_adapter.FacilityAdapter, facility_adapter.FacilityAdapter
 ):
     """A demo implementation of the FacilityAdapter that returns hardcoded data."""
     def __init__(self):
@@ -111,6 +115,8 @@ class DemoAdapter(
         self.facility = {}
         self.locations = []
         self.sites = []
+        self._interactive_store = InMemoryInteractiveStore()
+        self._interactive_procs: dict[str, list[asyncio.subprocess.Process]] = {}
         self._init_state()
 
     def _init_state(self):
@@ -1007,6 +1013,282 @@ class DemoAdapter(
                 t.status = task_models.TaskStatus.canceled
                 t.result = None
                 break
+
+    # ------------------------------------------------------------------
+    # InteractiveAdapter implementation
+    #
+    # The demo simulates each "node" by spawning a local subprocess. Real
+    # facilities would replace this with srun / ssh / a worker-pool RPC.
+    # State lives in `self._interactive_store` (InMemoryInteractiveStore);
+    # facility adapters can swap that for a Postgres/Redis-backed store.
+    # ------------------------------------------------------------------
+
+    async def create_session(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        spec: interactive_models.InteractiveSessionSpec,
+    ) -> interactive_models.InteractiveSession:
+        session_id = f"sess-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        nodes = [
+            interactive_models.NodeInfo(
+                node_id=f"{resource.id}-demo-{i}",
+                hostname=f"demo-{i}.{resource.id}.local",
+                state="ready",
+            )
+            for i in range(spec.node_count)
+        ]
+        session = interactive_models.InteractiveSession(
+            session_id=session_id,
+            resource_id=resource.id,
+            user_id=user.id,
+            status=interactive_models.SessionStatus.active,
+            spec=spec,
+            nodes=nodes,
+            job_id=f"demo-{session_id}",
+            created_at=now,
+            started_at=now,
+            expires_at=now + datetime.timedelta(seconds=spec.duration_seconds),
+        )
+        await self._interactive_store.save_session(session)
+        logger.info(f"Created interactive session {session_id} for {user.id} on {resource.id} ({spec.node_count} nodes)")
+        return session
+
+    async def _require_session(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+    ) -> interactive_models.InteractiveSession:
+        session = await self._interactive_store.get_session(session_id)
+        if session is None or session.user_id != user.id or session.resource_id != resource.id:
+            raise HTTPException(status_code=404, detail=f"Interactive session {session_id} not found")
+        # Lazy expiry
+        if session.status == interactive_models.SessionStatus.active and session.expires_at and utc_now() >= session.expires_at:
+            session.status = interactive_models.SessionStatus.expired
+            session.ended_at = utc_now()
+            await self._interactive_store.save_session(session)
+        return session
+
+    async def get_session(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+    ) -> interactive_models.InteractiveSession:
+        return await self._require_session(resource, user, session_id)
+
+    async def list_sessions(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+    ) -> list[interactive_models.InteractiveSession]:
+        return await self._interactive_store.list_sessions(user_id=user.id, resource_id=resource.id)
+
+    async def end_session(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+    ) -> None:
+        session = await self._require_session(resource, user, session_id)
+        # Cancel any in-flight commands first so we don't leak subprocesses.
+        for cmd in await self._interactive_store.list_commands(session_id):
+            if cmd.status in (interactive_models.CommandStatus.queued, interactive_models.CommandStatus.running):
+                await self._cancel_demo_processes(cmd.command_id)
+                cmd.status = interactive_models.CommandStatus.cancelled
+                cmd.completed_at = utc_now()
+                await self._interactive_store.save_command(cmd)
+        session.status = interactive_models.SessionStatus.terminated
+        session.ended_at = utc_now()
+        await self._interactive_store.save_session(session)
+        logger.info(f"Terminated interactive session {session_id}")
+
+    def _resolve_targets(
+        self: "DemoAdapter",
+        session: interactive_models.InteractiveSession,
+        target: str,
+    ) -> list[interactive_models.NodeInfo]:
+        if not session.nodes:
+            raise HTTPException(status_code=409, detail="Session has no nodes allocated")
+        if target == interactive_models.TARGET_ALL:
+            return list(session.nodes)
+        if target == interactive_models.TARGET_ONE:
+            # Deterministic so retries hit the same node; real adapters can load-balance.
+            return [session.nodes[0]]
+        for node in session.nodes:
+            if node.node_id == target:
+                return [node]
+        raise HTTPException(status_code=400, detail=f"Unknown target node_id: {target!r}")
+
+    async def dispatch_command(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+        spec: interactive_models.CommandSpec,
+    ) -> interactive_models.Command:
+        session = await self._require_session(resource, user, session_id)
+        if session.status != interactive_models.SessionStatus.active:
+            raise HTTPException(status_code=409, detail=f"Session is {session.status.value}, cannot accept commands")
+
+        targets = self._resolve_targets(session, spec.target)
+        command = interactive_models.Command(
+            command_id=f"cmd-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            resource_id=resource.id,
+            spec=spec,
+            status=interactive_models.CommandStatus.queued,
+            targets=[n.node_id for n in targets],
+            submitted_at=utc_now(),
+        )
+        await self._interactive_store.save_command(command)
+
+        if spec.blocking:
+            await self._execute_command(command, targets)
+            return await self._interactive_store.get_command(command.command_id)
+
+        # Non-blocking: kick off background execution and return the queued command.
+        asyncio.create_task(self._execute_command(command, targets))
+        return command
+
+    async def _execute_command(
+        self: "DemoAdapter",
+        command: interactive_models.Command,
+        targets: list[interactive_models.NodeInfo],
+    ) -> None:
+        command.status = interactive_models.CommandStatus.running
+        command.started_at = utc_now()
+        await self._interactive_store.save_command(command)
+
+        outputs = await asyncio.gather(
+            *(self._run_on_node(command, node) for node in targets),
+            return_exceptions=False,
+        )
+
+        final = await self._interactive_store.get_command(command.command_id)
+        if final is None:
+            return  # command was deleted (e.g. session ended)
+
+        # Respect an externally-set terminal status (cancel happens out-of-band).
+        terminal = {
+            interactive_models.CommandStatus.cancelled,
+            interactive_models.CommandStatus.completed,
+            interactive_models.CommandStatus.failed,
+            interactive_models.CommandStatus.timed_out,
+        }
+        if final.status in terminal:
+            self._interactive_procs.pop(command.command_id, None)
+            return
+
+        if any(o.stderr == "__IRI_TIMED_OUT__" for o in outputs):
+            # Normalize the sentinel
+            for o in outputs:
+                if o.stderr == "__IRI_TIMED_OUT__":
+                    o.stderr = "Command timed out before completion"
+                    await self._interactive_store.append_output(command.command_id, o)
+            final.status = interactive_models.CommandStatus.timed_out
+        elif all(o.exit_code == 0 for o in outputs):
+            final.status = interactive_models.CommandStatus.completed
+        else:
+            final.status = interactive_models.CommandStatus.failed
+        final.completed_at = utc_now()
+        await self._interactive_store.save_command(final)
+        self._interactive_procs.pop(command.command_id, None)
+
+    async def _run_on_node(
+        self: "DemoAdapter",
+        command: interactive_models.Command,
+        node: interactive_models.NodeInfo,
+    ) -> interactive_models.NodeOutput:
+        spec = command.spec
+        output = interactive_models.NodeOutput(node_id=node.node_id, started_at=utc_now())
+        # Save the "starting" partial so polling clients see progress immediately.
+        await self._interactive_store.append_output(command.command_id, output)
+
+        env = {**os.environ, **spec.env, "IRI_NODE_ID": node.node_id, "IRI_HOSTNAME": node.hostname or node.node_id}
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                spec.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if spec.stdin is not None else None,
+                cwd=spec.working_dir,
+                env=env,
+            )
+            self._interactive_procs.setdefault(command.command_id, []).append(proc)
+
+            stdin_bytes = spec.stdin.encode() if spec.stdin is not None else None
+            try:
+                if spec.timeout_seconds is not None:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=spec.timeout_seconds)
+                else:
+                    stdout, stderr = await proc.communicate(stdin_bytes)
+                output.stdout = stdout.decode(errors="replace")
+                output.stderr = stderr.decode(errors="replace")
+                output.exit_code = proc.returncode
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                output.exit_code = -1
+                output.stderr = "__IRI_TIMED_OUT__"  # sentinel handled by _execute_command
+        except Exception as exc:  # pylint: disable=broad-except
+            output.exit_code = -1
+            output.stderr = f"Failed to execute on {node.node_id}: {exc}"
+        finally:
+            output.completed_at = utc_now()
+            await self._interactive_store.append_output(command.command_id, output)
+        return output
+
+    async def get_command(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+        command_id: str,
+    ) -> interactive_models.Command:
+        await self._require_session(resource, user, session_id)
+        command = await self._interactive_store.get_command(command_id)
+        if command is None or command.session_id != session_id:
+            raise HTTPException(status_code=404, detail=f"Command {command_id} not found")
+        return command
+
+    async def list_commands(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+    ) -> list[interactive_models.Command]:
+        await self._require_session(resource, user, session_id)
+        return await self._interactive_store.list_commands(session_id)
+
+    async def cancel_command(
+        self: "DemoAdapter",
+        resource: status_models.Resource,
+        user: User,
+        session_id: str,
+        command_id: str,
+    ) -> None:
+        await self._require_session(resource, user, session_id)
+        command = await self._interactive_store.get_command(command_id)
+        if command is None or command.session_id != session_id:
+            raise HTTPException(status_code=404, detail=f"Command {command_id} not found")
+        if command.status not in (interactive_models.CommandStatus.queued, interactive_models.CommandStatus.running):
+            return  # already terminal
+        await self._cancel_demo_processes(command_id)
+        command.status = interactive_models.CommandStatus.cancelled
+        command.completed_at = utc_now()
+        await self._interactive_store.save_command(command)
+
+    async def _cancel_demo_processes(self: "DemoAdapter", command_id: str) -> None:
+        for proc in self._interactive_procs.pop(command_id, []):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(f"Failed to kill subprocess for command {command_id}: {exc}")
 
 
 class DemoTask(BaseModel):
