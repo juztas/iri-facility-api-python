@@ -109,3 +109,13 @@ class FacilityAdapter(AuthenticatedAdapter):
         command_id: str,
     ) -> None:
         """Cancel a queued or running command. No-op on already-terminal commands."""
+
+    @abstractmethod
+    async def run_queued_command(
+        self: "FacilityAdapter",
+        resource: status_models.Resource | None,
+        user: User,
+        session_id: str,
+        command_id: str,
+    ) -> dict:
+        """Execute one previously queued interactive command from a worker."""

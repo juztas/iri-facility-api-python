@@ -1,9 +1,14 @@
+import os
 import traceback
 from abc import abstractmethod
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
 from ...types.user import User
 from . import models as task_models
+from .local_queue import QueueSettings, get_task_queue
 from ..status import models as status_models
 from ..filesystem import models as filesystem_models, facility_adapter as filesystem_adapter
+from ..interactive import facility_adapter as interactive_adapter
 from ..iri_router import AuthenticatedAdapter, IriRouter
 
 from ...apilogger import get_stream_logger
@@ -100,6 +105,10 @@ class FacilityAdapter(AuthenticatedAdapter):
                     r = await fs_adapter.download(resource, user, **task.args)
                 elif task.command == "upload":
                     r = await fs_adapter.upload(resource, user, **task.args)
+            elif task.router == "interactive":
+                interactive = IriRouter.create_adapter(task.router, interactive_adapter.FacilityAdapter)
+                if task.command == "run_command":
+                    r = await interactive.run_queued_command(resource, user, **task.args)
             if r is not None:
                 return (r, task_models.TaskStatus.completed)
             else:
@@ -109,3 +118,49 @@ class FacilityAdapter(AuthenticatedAdapter):
             logger.warning(f"Error handling task {task.router}:{task.command} with args: {task.args}\nError: {exc}")
             logger.debug(f"Traceback:\n{traceback_str}")
             return ({"output": f"Error: {exc}"}, task_models.TaskStatus.failed)
+
+
+def drain_local_task_queue_once() -> bool:
+    """Claim and execute one locally queued task, if any."""
+    settings = QueueSettings.from_env()
+    queue = get_task_queue()
+    worker_id = os.environ.get("IRI_TASK_WORKER_ID", "local-worker")
+    lease = queue.claim_next(worker_id=worker_id, lease_seconds=settings.lease_seconds)
+    if lease is None:
+        return False
+
+    resource = lease.resource
+    if lease.command and lease.command.router != "interactive" and resource is None:
+        queue.complete_task(
+            task_id=lease.id,
+            status=task_models.TaskStatus.failed,
+            result={"output": "Queued task is missing a resource binding"},
+        )
+        return True
+
+    result, status = _run_task_sync(resource, lease.user, lease.command)
+    normalized = _normalize_task_result(result)
+    queue.complete_task(task_id=lease.id, status=status, result=normalized)
+    return True
+
+
+def _run_task_sync(
+    resource: status_models.Resource | None,
+    user: User,
+    command: task_models.TaskCommand | None,
+) -> tuple[dict | None, task_models.TaskStatus]:
+    import asyncio
+
+    if command is None:
+        return {"output": "Queued task is missing a command"}, task_models.TaskStatus.failed
+    return asyncio.run(FacilityAdapter.on_task(resource, user, command))
+
+
+def _normalize_task_result(result: dict | object | None) -> dict | None:
+    if result is None:
+        return None
+    if isinstance(result, BaseModel):
+        return result.model_dump(mode="json")
+    if isinstance(result, dict):
+        return jsonable_encoder(result)
+    return jsonable_encoder({"output": result})

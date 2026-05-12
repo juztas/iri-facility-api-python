@@ -13,11 +13,10 @@ import pwd
 import random
 import stat
 import subprocess
+import time
 import uuid
 
 from fastapi import HTTPException
-from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
 
 from .routers.account import facility_adapter as account_adapter
 from .routers.account import models as account_models
@@ -33,6 +32,7 @@ from .routers.interactive.store import InMemoryInteractiveStore
 from .routers.status import facility_adapter as status_adapter
 from .routers.status import models as status_models
 from .routers.task import facility_adapter as task_adapter
+from .routers.task.local_queue import get_task_queue
 from .routers.task import models as task_models
 from .types.models import Capability
 from .types.user import User
@@ -42,8 +42,7 @@ from .config import LOG_LEVEL
 
 logger = get_stream_logger(__name__, LOG_LEVEL)
 
-DEMO_QUEUE_UPDATE_SECS = int(os.environ.get("DEMO_QUEUE_UPDATE_SECS", 5))
-
+_DEMO_INTERACTIVE_STORE = InMemoryInteractiveStore()
 
 def paginate_list(items, offset: int | None, limit: int | None):
     """Return a sliced items using offset and limit."""
@@ -115,8 +114,9 @@ class DemoAdapter(
         self.facility = {}
         self.locations = []
         self.sites = []
-        self._interactive_store = InMemoryInteractiveStore()
+        self._interactive_store = _DEMO_INTERACTIVE_STORE
         self._interactive_procs: dict[str, list[asyncio.subprocess.Process]] = {}
+        self._task_queue = get_task_queue(backend=os.environ.get("IRI_DEMO_TASK_QUEUE_BACKEND", "memory"))
         self._init_state()
 
     def _init_state(self):
@@ -371,8 +371,8 @@ class DemoAdapter(
             sites = [s for s in sites if s.last_modified > ms]
 
         o = offset or 0
-        l = limit or len(sites)
-        return sites[o : o + l]
+        limit_count = limit or len(sites)
+        return sites[o : o + limit_count]
 
     async def get_site(self: "DemoAdapter", site_id: str, modified_since: str | None = None) -> facility_models.Site:
         site = next((s for s in self.sites if s.id == site_id), None)
@@ -995,24 +995,16 @@ class DemoAdapter(
         return filesystem_models.PostCopyResponse(output=self._file(dst_rp))
 
     async def get_task(self: "DemoAdapter", user: User, task_id: str) -> task_models.Task | None:
-        await DemoTaskQueue.process_tasks(self)
-        return next((t for t in DemoTaskQueue.tasks if t.user.name == user.name and t.id == task_id), None)
+        return self._task_queue.get_task(user=user, task_id=task_id)
 
     async def get_tasks(self: "DemoAdapter", user: User) -> list[task_models.Task]:
-        await DemoTaskQueue.process_tasks(self)
-        return [t for t in DemoTaskQueue.tasks if t.user.name == user.name]
+        return self._task_queue.list_tasks(user=user)
 
-    async def put_task(self: "DemoAdapter", user: User, resource: status_models.Resource, task: str) -> task_models.TaskSubmitResponse:
-        await DemoTaskQueue.process_tasks(self)
-        return DemoTaskQueue.create_task(user, resource, task)
+    async def put_task(self: "DemoAdapter", user: User, resource: status_models.Resource, task: task_models.TaskCommand) -> task_models.TaskSubmitResponse:
+        return self._task_queue.enqueue(user=user, resource=resource, task=task)
 
     async def delete_task(self: "DemoAdapter", user: User, task_id: str) -> None:
-        await DemoTaskQueue.process_tasks(self)
-        for t in DemoTaskQueue.tasks:
-            if t.user.name == user.name and t.id == task_id:
-                t.status = task_models.TaskStatus.canceled
-                t.result = None
-                break
+        self._task_queue.cancel_task(user=user, task_id=task_id)
 
     # ------------------------------------------------------------------
     # InteractiveAdapter implementation
@@ -1143,14 +1135,36 @@ class DemoAdapter(
             targets=[n.node_id for n in targets],
             submitted_at=utc_now(),
         )
+        task_submit = self._task_queue.enqueue(
+            user=user,
+            resource=resource,
+            task=task_models.TaskCommand(
+                router="interactive",
+                command="run_command",
+                args={"session_id": session_id, "command_id": command.command_id},
+            ),
+        )
+        command.task_id = task_submit.task_id
         await self._interactive_store.save_command(command)
 
         if spec.blocking:
-            await self._execute_command(command, targets)
-            return await self._interactive_store.get_command(command.command_id)
+            deadline = time.time() + max(spec.timeout_seconds or 60, 5)
+            while time.time() < deadline:
+                current = await self._interactive_store.get_command(command.command_id)
+                if current and current.status in {
+                    interactive_models.CommandStatus.completed,
+                    interactive_models.CommandStatus.failed,
+                    interactive_models.CommandStatus.timed_out,
+                    interactive_models.CommandStatus.cancelled,
+                }:
+                    return current
+                await asyncio.sleep(0.2)
+            command = await self._interactive_store.get_command(command.command_id) or command
+            command.status = interactive_models.CommandStatus.timed_out
+            command.completed_at = utc_now()
+            await self._interactive_store.save_command(command)
+            return command
 
-        # Non-blocking: kick off background execution and return the queued command.
-        asyncio.create_task(self._execute_command(command, targets))
         return command
 
     async def _execute_command(
@@ -1254,6 +1268,27 @@ class DemoAdapter(
             raise HTTPException(status_code=404, detail=f"Command {command_id} not found")
         return command
 
+    async def run_queued_command(
+        self: "DemoAdapter",
+        resource: status_models.Resource | None,
+        user: User,
+        session_id: str,
+        command_id: str,
+    ) -> dict:
+        if resource is None:
+            raise HTTPException(status_code=400, detail="Interactive task is missing a resource binding")
+        command = await self._interactive_store.get_command(command_id)
+        if command is None or command.session_id != session_id:
+            raise HTTPException(status_code=404, detail=f"Command {command_id} not found")
+        session = await self._require_session(resource, user, session_id)
+        if session.status != interactive_models.SessionStatus.active:
+            raise HTTPException(status_code=409, detail=f"Session is {session.status.value}, cannot accept commands")
+
+        targets = self._resolve_targets(session, command.spec.target)
+        await self._execute_command(command, targets)
+        final = await self._interactive_store.get_command(command_id)
+        return final.model_dump(mode="json") if final is not None else {"command_id": command_id}
+
     async def list_commands(
         self: "DemoAdapter",
         resource: status_models.Resource,
@@ -1289,52 +1324,3 @@ class DemoAdapter(
                 pass
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning(f"Failed to kill subprocess for command {command_id}: {exc}")
-
-
-class DemoTask(BaseModel):
-    """A simple in-memory task queue for demonstration purposes."""
-    id: str
-    task: str
-    resource: status_models.Resource
-    user: User
-    start: float
-    status: task_models.TaskStatus = task_models.TaskStatus.pending
-    result: dict | None = None
-
-
-class DemoTaskQueue:
-    """A simple in-memory task queue for demonstration purposes."""
-    tasks = []
-
-    @staticmethod
-    async def process_tasks(da: DemoAdapter):
-        """Process tasks in the queue, simulating task execution and completion."""
-        now = utc_timestamp()
-        _tasks = []
-        for t in DemoTaskQueue.tasks:
-            if now - t.start > 5 * 60 and t.status in [task_models.TaskStatus.completed, task_models.TaskStatus.canceled, task_models.TaskStatus.failed]:
-                # delete old tasks
-                continue
-            if t.status == task_models.TaskStatus.pending and now - t.start > DEMO_QUEUE_UPDATE_SECS:
-                t.status = task_models.TaskStatus.active
-                t.start = now
-            elif t.status == task_models.TaskStatus.active and now - t.start > DEMO_QUEUE_UPDATE_SECS:
-                cmd = task_models.TaskCommand.model_validate_json(t.task)
-                (result, status) = await DemoAdapter.on_task(t.resource, t.user, cmd)
-                if isinstance(result, BaseModel):
-                    t.result = result.model_dump()
-                elif isinstance(result, dict):
-                    t.result = result
-                else:
-                    t.result = {"output": result}
-                t.status = status
-            _tasks.append(t)
-        DemoTaskQueue.tasks = _tasks
-
-    @staticmethod
-    def create_task(user: User, resource: status_models.Resource, command: task_models.TaskCommand) -> task_models.TaskSubmitResponse:
-        """Create a new task in the queue."""
-        task_id = f"task_{len(DemoTaskQueue.tasks)}"
-        DemoTaskQueue.tasks.append(DemoTask(id=task_id, task=command.model_dump_json(), user=user, resource=resource, start=utc_timestamp()))
-        logger.info(f"Created task: {task_id}")
-        return task_models.TaskSubmitResponse(task_id=task_id)

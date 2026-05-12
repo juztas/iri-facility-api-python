@@ -142,6 +142,7 @@ class Command(IRIBaseModel):
     spec: CommandSpec = Field(..., description="Original dispatch spec")
     status: CommandStatus = Field(..., description="Current command status", example="running")
     targets: list[str] = Field(default_factory=list, description="Resolved node IDs the command was dispatched to")
+    task_id: str | None = Field(default=None, description="Backing queued task identifier, if command execution is queue-backed", example="task-abcd1234")
 
     @field_validator("submitted_at", "started_at", "completed_at", mode="before")
     @classmethod
